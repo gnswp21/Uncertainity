@@ -21,26 +21,94 @@
     - 예측 불확실성의 정확한 평가를 위해 후술할 앙상블에서 구해진 logit 값과 표준편차를 정규화하는 과정이 필요합니다.
     - 이 과정은 불확실성이 높은 예측을 더욱 정확하게 식별하고, 효과적으로 거부하는 데 중요한 역할을 합니다.
 
-## 구현 방법
-1. **대조군 실험**
+## 구현
+**uncertainty.ipynb** 파일은 실제 실험에 사용한 코드가 아닌 **핵심 로직만 재구현**한 코드입니다. 
+1. **세가지 모델**
    - 거부(reject) 옵션의 성능 향상 확인을 위한 대조군 실험
    - CNN, Alexnet, VGG11 모델에서 FMnist 데이터셋의 분류화 모델을 학습 후 테스트
- 
-2. **앙상블을 통해 새로운 앙상블 모델 생성**:
-    - 각각의 모델에 노이즈를 추가해 여러 모델을 생성한 후, 이들을 앙상블하여 예측(logit) 결과를 결합하고, 이를 평균 내어 최종 예측을 도출합니다.
-    - logit 값의 평균과 표준편차를 계산하여 예측의 신뢰도를 평가합니다.
 
-3. **예측 불확실성 - 포착**:
-    - **데이터 불확실성(Aleatoric Uncertainty)**:  모델의 로짓(logit)과 표준편차(standard deviation)를 통해 계산합니다.
-    - **모델 불확실성(Epistemic Uncertainty)**:  앙상블(ensemble)된 여러 모델의 로짓(logit)과 표준편차(standard deviation)를 통해 계산합니다.
+
+2. **데이터 불확실성(Aleatoric Uncertainty)**:
+   - 참고문헌[1]에 따라 데이터 불확실성은 분류 모델에 추가로 모델의 표준편차를 포착하게끔 모델링함으로써 구할 수 있습니다.
+```python
+...
+ for i, (imgs, labels) in enumerate(train_loader):
+     imgs, labels = imgs.to(device), labels.to(device)
+
+     sampling_outputs = model(imgs)
+     sampling_logit, sampling_std = sampling_outputs[:, :class_num], sampling_outputs[:, class_num : ]
+
+     x = torch.zeros(10)
+     e = torch.normal(x, 1).to(device)
+     noised_outputs =  sampling_logit + sampling_std * e
+     loss = criterion(noised_outputs, labels)
+...
+        
+```
+   - 데이터 불확실성은 로짓의 표준편차로 스케일링된 가우시안 노이즈로 모델링할 수 있습니다. 
+   - 이 떄의 표준편차는 두가지 모델링의 변화를 통해 포착할 수 있습니다.
+     - 1. 예를 들어, 10개의 분류 모델의 마지막 레이어를 10개의 아웃풋에서 20개의 아웃풋을 내는 것으로 수정 (10개의 로짓 -> 10개의 로짓 + 10개의 표준편차)
+     - 2. 로스 함수에 기존의 아웃풋이 아닌 기존에 아웃풋에 표준편차로 스케일링된 가우시안 노이즈로 노이즈된 아웃풋을 적용  
+
+2. **모델 불확실성(Epistemic Uncertainty)**:
+   - 참고문헌[1]에 따라 모델 불확실성을 표현하는 한 방식으로 베이지안
+     딥러닝 기법이 있습니다. 기존의 딥러닝 기법이
+     deterministic 하게 파라미터를 정하던 것에 반해,
+     베이지안 딥러닝 기법은 파라미터의 distribution 을
+     추정합니다.
+   - 단, MAP 방식은 비용이 비싸므로 참고문헌[2]에 따라 MC drop out으로 각각의 레이어에 걸려 있는 dropout layer 를
+     예측에서도 그대로 사용하여 여러 개의 모델을 통해 예측하는 ensemble 의 효과를 냅니다.
+   - 앙상블된 모델은 한번의 예측에 앙상블된 수만큼 결과가 나온는데, 이들의 표준편차가 모델 불확실성입니다.
    
-4. **예측 불확실성- 정규화**:
-    - 표준 편차는 모델의 logit 값에 비례해 커지는 경향을 보입니다. 
-    - 앙상블의 표준편차를 logit의 평균값으로 정규화하여 다양한 모델에서의 보편적인 reject 옵션 지표를 산출합니다.
+```python
+# Train Mode For MC Drop out
+model.train()
+T = 10
+rr = 0.1
+sm = torch.nn.Softmax(dim = 1)
+
+with torch.no_grad():
+   correct = 0
+   safe_correct = 0
+   total = 0
+   reject = 0
+   for i, (imgs, labels) in enumerate(test_loader):
+      imgs, labels = imgs.to(device), labels.to(device)
+
+      ## Sampling
+      sampling_out = torch.zeros([T, len(imgs), len(test_data.classes)]).to(device)
+
+      for t in range(T):
+         sampling_out[t] = model(imgs)
+
+      # ouputs => 100 x 10 # outputs_std => 100 x 10 # outputs_prob 100 x 10
+      outputs = torch.mean(sampling_out, dim = 0)
+      outputs_std = torch.std(sampling_out, dim = 0)
+      outputs_prob = sm(outputs)
+      ...
+```
+
+3. 예측 불확실성
+
+![예측 불학실성](prediction_uncertainity.png)
+ - 모델링, 모델 학습의 수정을 통해 데이터 불확실성을 포착합니다.
+ - MC drop out을 이용한 앙상블로 모델 불확실성을 포착합니다.
+ - 위 두가지 불확실성을 동시에 포착하여 하나로 합친 것이 예측 불확실성입니다.
+
+
+4. **예측 불확실성 - 정규화**:
+```python
+ #  분산 리스케일링
+max_std_normalize = torch.zeros_like(max_std)
+for i in range(len(imgs)):
+    max_std_normalize[i] = max_std[i] * 1/max_prob[i]
+```
+ -  모델 불확실성에서 표준 편차는 모델의 logit 값에 비례해 커지는 경향을 보입니다. 
+ - 앙상블의 표준편차를 logit의 평균값으로 정규화하여 다양한 모델에서의 보편적인 reject 옵션 지표를 산출합니다.
    
-5. **불확실성 계산 및 거부 옵션 적용**:
+5 **불확실성 계산 및 거부 옵션 적용**:
     - 정규화된 표준편차가 높아 불확실성이 큰 경우 예측을 거부하고, 나머지 예측만을 최종 결과로 사용합니다.
-    - 거부된 예측이 없는 경우, 모델의 예측을 그대로 사용합니다.
+   
 
 ## 실험 결과
 <p align="center">
@@ -62,3 +130,14 @@
 ## 기대
 
 이 프로젝트의 결과물은 의료 진단, 자율주행, 금융 시스템 등 한 번의 실수가 큰 문제를 일으킬 수 있는 분야에서 신뢰할 수 있는 예측을 제공하는 데 사용될 수 있습니다. 예측 불확실성을 효과적으로 관리함으로써, 안전성을 높이고 잘못된 의사결정으로 인한 위험을 줄일 수 있습니다.
+
+## 참고문헌
+- [1] Kendall, A., & Gal, Y. (2017). What uncertainties
+do we need in bayesian deep learning for computer
+vision?. arXiv preprint arXiv:1703.04977.
+
+- [2] Gal, Y., & Ghahramani, Z. (2016, June). Dropout
+as a bayesian approximation: Representing model
+uncertainty in deep learning. In international
+conference on machine learning (pp. 1050-1059).
+PMLR.
